@@ -2,6 +2,15 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
+#include <furi_hal.h>
+
+#define SPEED 10.0f
+#define MIN_FREQ 100
+#define MAX_FREQ 1000 
+#define ALERT_THRESHOLD 200.0f
+
+#include "font.h"
+#include "russian.h"
 
 typedef enum {
     PHUnit_PolyLyah,
@@ -19,6 +28,8 @@ typedef struct {
     NotificationApp* notifications;
     float fluctuation;
     uint32_t last_sound_time;
+    bool alert_state;
+    uint32_t last_alert_time;
 } PHMeterState;
 
 typedef struct {
@@ -33,20 +44,20 @@ void draw_callback(Canvas* canvas, void* ctx) {
     PHMeterState* state = app->state;
     
     canvas_clear(canvas);
-    canvas_set_font(canvas, FontPrimary);
+    canvas_set_custom_u8g2_font(canvas, u8g2_font_6x12_t_cyrillic);
     
-    const char* unit_names[] = {"PolyLyahi", "Lyahi", "MegaLyahi", "GigaLyahi"};
-    canvas_draw_str(canvas, 2, 12, unit_names[state->unit]);
-    canvas_draw_str(canvas, 60, 12, "XyeTA");
+    const char* unit_names[] = {"Полуляхов", "Ляхов", "Мегаляхов", "Гигаляхов"};
+    draw_utf8_str(canvas, 40, 32, unit_names[state->unit]);
+    draw_utf8_str(canvas, 2, 12, "ПолнаяХуйняМетр");
     char value_str[32];
     if(state->is_measuring) {
         snprintf(value_str, sizeof(value_str), "%.2lf", (double)state->current_value);
-        canvas_draw_str(canvas, 2, 32, value_str);
+        draw_utf8_str(canvas, 2, 32, value_str);
         
-        uint8_t bar_width = (uint8_t)((state->measure_progress / 250.0f) * 100);
+        uint8_t bar_width = (uint8_t)((state->measure_progress / 250.0f) * 115);
         canvas_draw_box(canvas, 2, 40, bar_width, 6);
     } else {
-        canvas_draw_str(canvas, 2, 32, "---");
+        draw_utf8_str(canvas, 2, 32, "---");
     }
 }
 
@@ -55,79 +66,56 @@ void input_callback(InputEvent* input_event, void* ctx) {
     furi_message_queue_put(app->input_queue, input_event, FuriWaitForever);
 }
 
-static const NotificationSequence sequence_c4 = {
-    &message_note_c4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_d4 = {
-    &message_note_d4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_e4 = {
-    &message_note_e4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_f4 = {
-    &message_note_f4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_g4 = {
-    &message_note_g4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_a4 = {
-    &message_note_a4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_b4 = {
-    &message_note_b4,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static const NotificationSequence sequence_c5 = {
-    &message_note_c5,
-    &message_delay_50,
-    &message_sound_off,
-    NULL,
-};
-
-static void play_note_by_progress(NotificationApp* notifications, float progress) {
-    const NotificationSequence* sequences[] = {
-        &sequence_c4,
-        &sequence_d4,
-        &sequence_e4,
-        &sequence_f4,
-        &sequence_g4,
-        &sequence_a4,
-        &sequence_b4,
-        &sequence_c5
-    };
+static void update_alerts(PHMeterApp* app) {
+    PHMeterState* state = app->state;
+    uint32_t current_time = furi_get_tick();
     
-    int note_index = (int)((progress / 250.0f) * 7);
-    if(note_index < 0) note_index = 0;
-    if(note_index > 7) note_index = 7;
+    if(state->measure_progress >= ALERT_THRESHOLD) {
+        if(current_time - state->last_alert_time > 100) {
+            state->alert_state = !state->alert_state;
+            state->last_alert_time = current_time;
+            
+            if(state->alert_state) {
+                notification_message(state->notifications, &sequence_set_only_red_255);
+                notification_message(state->notifications, &sequence_set_vibro_on);
+            } else {
+                notification_message(state->notifications, &sequence_reset_red);
+                notification_message(state->notifications, &sequence_reset_vibro);
+            }
+        }
+    } else {
+        if(state->alert_state) {
+            notification_message(state->notifications, &sequence_reset_vibro);
+            notification_message(state->notifications, &sequence_reset_red);
+            state->alert_state = false;
+        }
+    }
+}
+
+static void play_smooth_sound(float progress) {
+    if(!furi_hal_speaker_is_mine()) {
+        if(!furi_hal_speaker_acquire(1000)) {
+            return;
+        }
+    }
     
-    notification_message(notifications, sequences[note_index]);
+    float progress_normalized = progress / 250.0f;
+    if(progress_normalized > 1.0f) progress_normalized = 1.0f;
+    if(progress_normalized < 0.0f) progress_normalized = 0.0f;
+    
+    uint32_t frequency = MIN_FREQ + (uint32_t)(progress_normalized * (MAX_FREQ - MIN_FREQ));
+    
+    if(frequency < MIN_FREQ) frequency = MIN_FREQ;
+    if(frequency > MAX_FREQ) frequency = MAX_FREQ;
+    
+    furi_hal_speaker_start(frequency, 0.5f);
+}
+
+static void stop_sound() {
+    if(furi_hal_speaker_is_mine()) {
+        furi_hal_speaker_stop();
+        furi_hal_speaker_release();
+    }
 }
 
 static void update_measurement(PHMeterApp* app) {
@@ -136,18 +124,25 @@ static void update_measurement(PHMeterApp* app) {
     
     if(state->is_measuring) {
         if(state->measure_progress < state->target_value) {
-            state->measure_progress += 5.0f;
-            if(state->measure_progress > state->target_value) state->measure_progress = state->target_value;
+            state->measure_progress += SPEED;
+            if(state->measure_progress > state->target_value) 
+                state->measure_progress = state->target_value;
         }
         
         state->fluctuation = (float)(rand() % 100) / 100.0f - 0.5f;
         state->current_value = state->measure_progress + state->fluctuation;
         
-        // Play sound every 100ms
         if(current_time - state->last_sound_time > 100) {
-            play_note_by_progress(state->notifications, state->measure_progress);
+            FURI_CRITICAL_ENTER();
+            play_smooth_sound(state->measure_progress);
+            FURI_CRITICAL_EXIT();
             state->last_sound_time = current_time;
         }
+        update_alerts(app);
+    } else {
+        stop_sound();
+        notification_message(state->notifications, &sequence_reset_vibro);
+        notification_message(state->notifications, &sequence_reset_red);
     }
 }
 
@@ -164,6 +159,8 @@ int32_t phmetr_app(void* p) {
     app->state->fluctuation = 0.0f;
     app->state->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->state->last_sound_time = 0;
+    app->state->alert_state = false;
+    app->state->last_alert_time = 0;
     
     app->input_queue = furi_message_queue_alloc(8, sizeof(InputEvent));
     app->view_port = view_port_alloc();
@@ -183,6 +180,9 @@ int32_t phmetr_app(void* p) {
                     app->state->measure_progress = 0.0f;
                 } else if(input.type == InputTypeRelease) {
                     app->state->is_measuring = false;
+                    stop_sound();
+                    notification_message(app->state->notifications, &sequence_reset_vibro);
+                    notification_message(app->state->notifications, &sequence_reset_red);
                 }
             } else if(input.type == InputTypePress) {
                 switch(input.key) {
@@ -221,6 +221,7 @@ exit:
     view_port_enabled_set(app->view_port, false);
     gui_remove_view_port(app->gui, app->view_port);
     view_port_free(app->view_port);
+    stop_sound();
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_NOTIFICATION);
     free(app->state);
